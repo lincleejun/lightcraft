@@ -15,7 +15,9 @@ fn err(e: impl std::fmt::Display) -> Error {
 }
 
 pub(crate) fn decode(bytes: &[u8], opts: &DecodeOptions) -> Result<Decoded> {
-    let mut d = Decoder::new(std::io::Cursor::new(bytes)).map_err(err)?.with_limits(limits(opts));
+    let mut d = Decoder::new(std::io::Cursor::new(bytes)).map_err(err)?;
+    let compression = d.get_tag_u32(Tag::Compression).ok();
+    let mut d = d.with_limits(limits(opts, bytes.len(), compression));
     let (w, h) = d.dimensions().map_err(err)?;
     check_size(F, w as u64, h as u64, opts)?;
     let ct = d.colortype().map_err(err)?;
@@ -26,7 +28,6 @@ pub(crate) fn decode(bytes: &[u8], opts: &DecodeOptions) -> Result<Decoded> {
     let planar = d.get_tag_u32(Tag::PlanarConfiguration).ok() == Some(2);
     let extra = d.get_tag_u16_vec(Tag::ExtraSamples).ok().unwrap_or_default();
     let colormap = d.get_tag_u16_vec(Tag::ColorMap).ok();
-    let compression = d.get_tag_u32(Tag::Compression).ok();
 
     let (model, n_color, n_samples, bits) = layout(ct, compression, planar)?;
     let has_alpha = n_samples > n_color && !matches!(ct, ColorType::Palette(_));
@@ -92,9 +93,25 @@ pub(crate) fn decode(bytes: &[u8], opts: &DecodeOptions) -> Result<Decoded> {
     finish(F, raw, meta, (w, h), opts)
 }
 
-fn limits(opts: &DecodeOptions) -> Limits {
+/// JPEG-in-TIFF (compression 7): the `tiff` crate copies each compressed chunk into memory before
+/// decoding it, so for it a chunk's declared size is an allocation, not just a read.
+const COMPRESSION_JPEG: u32 = 7;
+
+/// Decoder limits for a file of `file_len` bytes stored with `compression`. The image buffer
+/// follows `max_pixels` (the dimensions are checked against it before anything is read). One strip
+/// or tile may claim as many bytes as the whole file when the method streams (none, LZW, Deflate,
+/// PackBits, CCITT): Lightroom and Photoshop write uncompressed exports as a single strip, 132 MiB
+/// for a 16-bit 23 MP photo, and the crate's default of 128 MiB refused them before reading a byte
+/// ("decoder limits exceeded", #1983). The default stays the floor, so nothing that decoded before
+/// is refused now (a small file whose writer overstated a count is tolerated as before), and a
+/// count larger than both the floor and the file is still refused. JPEG chunks keep the default:
+/// the crate copies them, and a hostile count would copy most of the file again.
+fn limits(opts: &DecodeOptions, file_len: usize, compression: Option<u32>) -> Limits {
     let mut limits = Limits::default();
     limits.decoding_buffer_size = opts.max_pixels.saturating_mul(4 * 8).min(usize::MAX as u64) as usize;
+    if compression != Some(COMPRESSION_JPEG) {
+        limits.intermediate_buffer_size = limits.intermediate_buffer_size.max(file_len);
+    }
     limits.ifd_value_size = 32 << 20;
     limits
 }
@@ -126,11 +143,12 @@ fn layout(ct: ColorType, compression: Option<u32>, planar: bool) -> Result<(Mode
 /// as a decode would refuse it: a layout or compression we can't decode, or strips/tiles that
 /// start past the end of the file (truncated). The compressed data itself is not checked.
 pub(crate) fn header(bytes: &[u8]) -> Result<(u32, u32, u16)> {
-    let mut d = Decoder::new(std::io::Cursor::new(bytes)).map_err(err)?.with_limits(limits(&DecodeOptions::default()));
+    let mut d = Decoder::new(std::io::Cursor::new(bytes)).map_err(err)?;
+    let compression = d.get_tag_u32(Tag::Compression).ok();
+    let mut d = d.with_limits(limits(&DecodeOptions::default(), bytes.len(), compression));
     let (w, h) = d.dimensions().map_err(err)?;
     check_size(F, w as u64, h as u64, &DecodeOptions::default())?;
     let ct = d.colortype().map_err(err)?;
-    let compression = d.get_tag_u32(Tag::Compression).ok();
     let planar = d.get_tag_u32(Tag::PlanarConfiguration).ok() == Some(2);
     layout(ct, compression, planar)?;
     // what this build of the `tiff` crate decompresses: none, CCITT G4, LZW, JPEG, Deflate, PackBits
@@ -238,5 +256,93 @@ fn select_channels(buf: Buf, n: usize, s: usize, keep: usize) -> Buf {
         Buf::U8(v) => Buf::U8(go(v, n, s, keep)),
         Buf::U16(v) => Buf::U16(go(v, n, s, keep)),
         Buf::F32(v) => Buf::F32(go(v, n, s, keep)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A little-endian classic TIFF, `w` × `h` RGB at `bits` per sample, uncompressed, as one strip of
+    /// `declared` bytes (the payload is as long as the image really is, filled with `fill`).
+    fn single_strip_rgb(w: u32, h: u32, bits: u16, declared: u32, fill: u8) -> Vec<u8> {
+        let entries: [(u16, u16, u32, u32); 11] = [
+            (256, 4, 1, w),
+            (257, 4, 1, h),
+            (258, 3, 3, 0), // BitsPerSample → offset, patched below
+            (259, 3, 1, 1), // uncompressed
+            (262, 3, 1, 2), // RGB
+            (273, 4, 1, 0), // StripOffsets, patched below
+            (277, 3, 1, 3),
+            (278, 4, 1, h), // one strip
+            (279, 4, 1, declared),
+            (284, 3, 1, 1), // chunky
+            (296, 3, 1, 2),
+        ];
+        let bps_off = 8 + 2 + entries.len() * 12 + 4;
+        let data_off = bps_off + 8;
+        let mut f = Vec::with_capacity(data_off + (w as usize) * (h as usize) * 3 * (bits as usize / 8));
+        f.extend_from_slice(b"II*\0");
+        f.extend_from_slice(&8u32.to_le_bytes());
+        f.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (tag, typ, count, value) in entries {
+            let value = match tag {
+                258 => bps_off as u32,
+                273 => data_off as u32,
+                _ => value,
+            };
+            f.extend_from_slice(&tag.to_le_bytes());
+            f.extend_from_slice(&typ.to_le_bytes());
+            f.extend_from_slice(&count.to_le_bytes());
+            f.extend_from_slice(&value.to_le_bytes());
+        }
+        f.extend_from_slice(&0u32.to_le_bytes());
+        for _ in 0..3 {
+            f.extend_from_slice(&bits.to_le_bytes());
+        }
+        f.extend_from_slice(&[0, 0]);
+        assert_eq!(f.len(), data_off);
+        f.resize(data_off + (w as usize) * (h as usize) * 3 * (bits as usize / 8), fill);
+        f
+    }
+
+    /// Issue #1983: Lightroom and Photoshop write uncompressed TIFFs as one strip, and the `tiff`
+    /// crate refuses any strip larger than `intermediate_buffer_size` (128 MiB by default) before
+    /// reading it. The bound follows the file for methods that stream; JPEG keeps the default.
+    #[test]
+    fn a_strip_may_be_as_large_as_the_file_unless_jpeg() {
+        let l = limits(&DecodeOptions::default(), 200 << 20, Some(1));
+        assert_eq!(l.intermediate_buffer_size, 200 << 20);
+        assert_eq!(limits(&DecodeOptions::default(), 200 << 20, None).intermediate_buffer_size, 200 << 20);
+        // smaller files keep the old bound: nothing that decoded before is refused
+        assert_eq!(limits(&DecodeOptions::default(), 10 << 20, Some(1)).intermediate_buffer_size, 128 << 20);
+        // the crate copies a JPEG chunk before decoding it: its declared size stays bounded as before
+        assert_eq!(limits(&DecodeOptions::default(), 200 << 20, Some(COMPRESSION_JPEG)).intermediate_buffer_size, 128 << 20);
+        assert_eq!(l.decoding_buffer_size, (1usize << 30) * 32);
+    }
+
+    /// The reporter's layout: 16-bit RGB 3923 × 5877 as one strip of 131.9 MiB, decoded with the
+    /// thumbnail path's options (64 MP). Before the fix: `Malformed(Tiff, "decoder limits exceeded")`.
+    #[test]
+    fn a_single_strip_over_128_mib_decodes() {
+        let (w, h) = (3923u32, 5877u32);
+        let strip = w * h * 3 * 2;
+        let f = single_strip_rgb(w, h, 16, strip, 0x80);
+        assert!(strip > 128 << 20 && f.len() > 128 << 20, "{} bytes", f.len());
+        let d = decode(&f, &DecodeOptions { max_size: Some((64, 64)), max_pixels: 64_000_000 }).unwrap();
+        assert_eq!(d.bit_depth, 16);
+        assert!(d.image.width <= 64 && d.image.height <= 64, "{}×{}", d.image.width, d.image.height);
+        // every sample is 0x8080 of 0xffff
+        let v = lightcraft_color::transfer::srgb_to_linear(0x8080 as f32 / 65535.0);
+        assert!(d.image.data.iter().all(|p| p.iter().all(|c| (c - v).abs() < 1e-3)), "{:?}", d.image.data.first());
+    }
+
+    /// A count larger than the floor and the file (200 MiB declared, 48 bytes present) is an error,
+    /// not a panic and not an image.
+    #[test]
+    fn a_strip_count_past_the_file_and_the_floor_is_an_error() {
+        let f = single_strip_rgb(4, 4, 8, 200 << 20, 0x80);
+        let e = decode(&f, &DecodeOptions::default()).expect_err("refused");
+        assert!(matches!(e, Error::Malformed(..)), "{e:?}");
     }
 }
